@@ -244,7 +244,7 @@ function newSection(): Section {
 }
 function diffPath(text: string): string | null {
   const t = text.split('\t')[0]!.trim();
-  if (t === '/dev/null' || t === '') return null;
+  if (t === '/dev/null') return null;
   return t.startsWith('a/') || t.startsWith('b/') ? t.slice(2) : t;
 }
 
@@ -262,7 +262,7 @@ function applyHunks(text: string, hunks: Hunk[], strict: boolean, path: string):
     let atEnd = false;
     let tier = 0;
     if (oRaw.length === 0) {
-      pos = Math.min(h.a + d, s.lines.length);
+      pos = Math.max(0, Math.min(h.a + d, s.lines.length));
       atEnd = pos === s.lines.length;
     } else {
       const target = h.a - 1 + d;
@@ -338,7 +338,8 @@ function unifiedEdit(sec: Section): Edit {
     if (oldPath === null && newPath !== null) {
       if (tree.get(newPath) !== null) throw new Fail('exists', newPath);
       const plus = sec.hunks.flatMap((h) => cleanBody(trimBody(h.body)).filter((l) => l.tag === '+').map((l) => l.text));
-      const noEol = sec.hunks.some((h) => noEolAfter(trimBody(h.body)));
+      const allBodies = sec.hunks.flatMap((h) => trimBody(h.body));
+      const noEol = noEolAfter(allBodies);
       tree.now.set(newPath, plus.length === 0 ? '' : plus.join('\n') + (noEol ? '' : '\n'));
       return;
     }
@@ -406,7 +407,8 @@ function searchReplaceEdits(lines: string[]): Edit[] {
 
 function v4aEdits(lines: string[]): Edit[] {
   const first = lines.findIndex((l) => !blank(l));
-  if (first < 0 || lines[first]!.trim() !== '*** Begin Patch') throw new Exit2('error: parse 1');
+  if (first < 0) throw new Exit2('error: parse 1');
+  if (lines[first]!.trim() !== '*** Begin Patch') throw new Exit2(`error: parse ${first + 1}`);
   let last = lines.length - 1;
   while (last >= 0 && blank(lines[last]!)) last -= 1;
   if (last < 0 || lines[last]!.trim() !== '*** End Patch') throw new Exit2(`error: parse ${lines.length + 1}`);
@@ -494,14 +496,15 @@ function v4aEdits(lines: string[]): Edit[] {
         const { o, n, oRaw } = pair(cleanBody(trimmed));
         let pos: number;
         let tier = 0;
+        let foundEof = false;
         if (chunk.eof) {
-          if (oRaw.length === 0) pos = s0.lines.length;
+          if (oRaw.length === 0) { pos = s0.lines.length; foundEof = true; }
           else {
-            const found = findTier(oRaw, s0.lines, STRICT, cursor);
-            const hit = found?.hits.find((h) => h + oRaw.length === s0.lines.length);
-            if (found === null || hit === undefined) throw new Fail('no-match', path);
-            tier = found.tier;
-            pos = hit;
+            for (let t = 0; t <= (STRICT ? 0 : 2); t += 1) {
+              const hit = occurrences(oRaw, s0.lines, t, cursor).find((h) => h + oRaw.length === s0.lines.length);
+              if (hit !== undefined) { tier = t; pos = hit; foundEof = true; break; }
+            }
+            if (!foundEof) throw new Fail('no-match', path);
           }
         } else if (oRaw.length === 0) pos = Math.min(cursor, s0.lines.length);
         else {
@@ -575,17 +578,26 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   const rows: string[] = [];
-  const movedFrom = new Set([...tree.moved.values()]);
+  const moveRows = new Set<string>();
+  const moveFroms = new Set<string>();
+  for (const [to, from] of tree.moved) {
+    if (tree.original(from) !== null && tree.now.get(from) === null && tree.original(to) === null && tree.now.get(to) !== null) {
+      moveRows.add(to);
+      moveFroms.add(from);
+    }
+  }
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
-    const from = tree.moved.get(p);
-    const isMove = from !== undefined && tree.original(from) !== null && tree.original(p) === null;
-    if (!movedFrom.has(p)) {
-      if (isMove) rows.push(`R ${from} -> ${p}`);
-      else rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
+    if (moveFroms.has(p)) {
+      if (check) continue;
+      if (now === null) rmSync(p, { force: true });
+      else { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, now); }
+      continue;
     }
+    if (moveRows.has(p)) rows.push(`R ${tree.moved.get(p)!} -> ${p}`);
+    else rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
     if (check) continue;
     if (now === null) rmSync(p, { force: true });
     else {
